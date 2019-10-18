@@ -1,0 +1,509 @@
+#include <avr/io.h>
+#define F_CPU 16000000UL
+#include <util/delay.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <avr/interrupt.h>
+
+#define SREG  _SFR_IO8(0x3F)
+
+
+#define DEFAULT_BUFFER_SIZE  200
+#define DEFAULT_TIMEOUT      20000
+#define DEFAULT_CRLF_COUNT   2
+
+#define POST 1
+#define GET  0
+
+//uart
+
+#define UART_BAUD_RATE 9600
+#define BAUD_PRESCALE  ((F_CPU/(16UL*UART_BAUD_RATE))-1)
+void UART_Init(void);
+void UART_Transmit(char data);
+char UART_Receive(void);
+void UART_SendString(char *str);
+
+
+
+
+#define GET_DEMO
+//#define POST_DEMO
+
+#define URL              "api.thingspeak.com/update"
+#define API_WRITE_KEY    "your write key"
+#define CHANNEL_ID        "put channel ID here"
+#define APN               "Safaricom"
+#define USERNAME          "Onkaev"
+#define PASSWORD          "magicalroot"
+
+void Read_Response(void);
+void Start_Read_Response(void);
+void Buffer_Flush(void);
+void GetResponseBody(char *Response, uint16_t ResponseLength);
+bool Wait_For_Expected_Response(char *ExpectedResponse);
+bool Send_AT_and_Expect_Response(char *ATCommand, char *ExpectedResponse);
+bool HTTP_Parameter(char *Parameter, char *Value);
+bool SIM900HTTP_Start(void);
+bool SIM900HTTP_Connect(char * _APN, char *_USERNAME, char *_PASSWORD);
+bool HTTP_Init(void);
+bool HTTP_Terminate(void);
+bool HTTP_Setup_URL(char *url);
+bool HTTP_Connected(void);
+bool HTTP_Setpost_json(void);
+bool HTTP_Save(void);
+bool HTTP_Data(char *data);      //load http data
+bool HTTP_Action(char method);   //select http action
+bool HTTP_Read(uint8_t StartByte, uint16_t Bytesize);   //read http response
+uint8_t HTTP_Post(char *Parameters, uint16_t ResponseLength);
+uint8_t HTTP_get(char *_URL, uint16_t ResponseLength);
+bool SIM900HTTP_Init(void);
+
+
+
+
+
+enum SIM900_RESPONSE_STATUS 
+{
+	SIM900_RESPONSE_WAITING,
+	SIM900_RESPONSE_FINISHED,
+	SIM900_RESPONSE_TIMEOUT,
+	SIM900_RESPONSE_BUFFER_FULL,
+	SIM900_RESPONSE_STARTING,
+	SIM900_RESPONSE_ERROR
+};
+
+char Response_Status, CRLF_COUNT = 0;
+uint16_t Counter = 0;
+uint32_t Timeout = 0;
+char RESPONSE_BUFFER[DEFAULT_BUFFER_SIZE];
+
+
+
+
+int main(void)
+{
+	char _buffer[100];
+	
+	#ifdef POST_DEMO
+	uint8_t Sample = 0;
+	#endif
+	
+	UART_Init();
+	sei();
+	
+	while(!SIM900HTTP_Start());
+	while(!(SIM900HTTP_Connect(APN, USERNAME, PASSWORD)));
+	SIM900HTTP_Init();
+	
+	
+	while(1)
+	{
+		if(!HTTP_Connected())
+		{
+			SIM900HTTP_Connect(APN, USERNAME, PASSWORD);
+			SIM900HTTP_Init();
+		}
+		
+		//local buffer to copy response from server
+		uint16_t responseLength = 100;
+		
+		#ifdef POST_DEMO
+		memset(_buffer, 0, 100);
+		HTTP_Setup_URL(URL); HTTP_Save();
+		sprintf(_buffer, "api_key=%s&field1=%d", API_WRITE_KEY, Sample++);
+		HTTP_Post(_buffer, responseLength);
+		_delay_ms(15000);                    //thingspeak server delay
+		#endif
+		
+		#ifdef GET_DEMO
+		memset(_buffer, 0, 100);
+		sprintf(_buffer, "api.thingspeak.com/channels/%s/feeds/last.txt", CHANNEL_ID);
+		HTTP_get(_buffer, responseLength);
+		
+		#endif	
+		
+	}
+}
+
+
+
+
+
+
+void Read_Response(void)
+{
+	static char CRLF_BUF[2];
+	static char CRLF_FOUND;
+	uint32_t TimeCount = 0, ResponseBufferLength;
+	while(1)
+	{
+		if(TimeCount >= (DEFAULT_TIMEOUT + Timeout))
+		{
+			CRLF_COUNT = 0;
+			Timeout = 0;
+			Response_Status = SIM900_RESPONSE_TIMEOUT;
+			return;
+		}
+		
+		if(Response_Status == SIM900_RESPONSE_STARTING)
+		{
+			CRLF_FOUND = 0;
+			memset(CRLF_BUF, 0, 2);
+			Response_Status = SIM900_RESPONSE_WAITING;
+		}
+		
+		ResponseBufferLength = strlen(RESPONSE_BUFFER);
+		
+		if (ResponseBufferLength)
+		{
+			_delay_ms(1);
+			TimeCount++;
+			
+			if(ResponseBufferLength == strlen(RESPONSE_BUFFER))
+			{
+				for (uint16_t i = 0; i<ResponseBufferLength ; i++)
+				{
+					memmove(CRLF_BUF, CRLF_BUF + 1, 1);      //confirm
+					CRLF_BUF[1] = RESPONSE_BUFFER[i];
+					
+					if(!strncmp(CRLF_BUF, "\r\n", 2))
+					{
+						if (++CRLF_FOUND == (DEFAULT_CRLF_COUNT + CRLF_COUNT))
+						{
+							CRLF_COUNT = 0;
+							Timeout = 0;
+							Response_Status = SIM900_RESPONSE_FINISHED;
+							return;
+						}
+					}
+				}
+				CRLF_FOUND = 0;
+			}
+		}
+		_delay_ms(1);
+		TimeCount ++;
+	}
+}
+
+void Start_Read_Response()
+{
+	Response_Status = SIM900_RESPONSE_STARTING;
+	
+	do 
+	{
+		Read_Response();
+	} while (Response_Status == SIM900_RESPONSE_WAITING);
+}
+
+void Buffer_Flush(void)       //clears all variables
+{
+	memset(RESPONSE_BUFFER, 0, DEFAULT_BUFFER_SIZE);
+	Counter = 0;
+}
+
+void GetResponseBody(char *Response, uint16_t ResponseLength)
+{
+	uint16_t i = 12;
+	char buffer[5];
+	
+	while(Response[i] != '\r' && i < 100)
+	{
+		++i;
+	}
+	
+	strncpy(buffer, Response + 12, (i - 12));
+	ResponseLength = atoi(buffer);
+	
+	i += 2;
+	uint16_t tmp = strlen(Response) - i;
+	memcpy(Response, Response + i, tmp);
+	
+	if(!strncmp(Response + tmp - 6, "\r\nOK\r\n", 6))
+	{
+		memset(Response + tmp - 6, 0, i + 6);
+	}
+}
+
+bool Wait_For_Expected_Response(char *ExpectedResponse)
+{
+	Buffer_Flush();
+	_delay_ms(200);
+	Start_Read_Response();            //first read response
+	
+	if((Response_Status != SIM900_RESPONSE_TIMEOUT) && (strstr(RESPONSE_BUFFER, ExpectedResponse) != NULL))
+	{
+		return true;
+	}
+	
+	return false;
+	
+}
+
+
+bool Send_AT_and_Expect_Response(char *ATCommand, char *ExpectedResponse)
+{
+	UART_SendString(ATCommand);
+	UART_Transmit('\r');
+	return Wait_For_Expected_Response(ExpectedResponse);
+
+}
+
+
+bool HTTP_Parameter(char *Parameter, char *Value)
+{
+	UART_SendString("AT+HTTPPARA=\"");
+	UART_SendString(Parameter);
+	UART_SendString("\",\"");
+	UART_SendString(Value);
+	UART_SendString("\"\r");
+	return Wait_For_Expected_Response("OK");
+}
+
+
+bool SIM900HTTP_Start(void)
+{
+	for (uint8_t i = 0; i < 5 ; i++)
+	{
+		if (Send_AT_and_Expect_Response("ATE0", "OK") || Send_AT_and_Expect_Response("AT", "OK"))
+		{
+			HTTP_Parameter("CID", "1");
+			return true;
+		}
+	}
+	return false;
+}
+
+
+bool SIM900HTTP_Connect(char * _APN, char *_USERNAME, char *_PASSWORD)  //setting bearer parameters
+{
+	UART_SendString("AT+CREG?\r");
+	
+	if(!Wait_For_Expected_Response("+CREG: 0,1"))
+		return false;
+	
+	UART_SendString("AT+SAPBR=0,1\r");
+	Wait_For_Expected_Response("OK");
+	
+	UART_SendString("AT+SAPBR=3,1,\"CONTYPE\",\"GPRS\"\r");  //set connection type to GPRS
+	Wait_For_Expected_Response("OK");
+	
+	UART_SendString("AT+SAPBR=3,1,\"APN\",\"");
+	UART_SendString(_APN);
+	UART_SendString("\"\r");
+	Wait_For_Expected_Response("OK");
+	
+	UART_SendString("AT+SAPBR=3,1,\"USER\",\"");
+	UART_SendString(_USERNAME);
+	UART_SendString("\"\r");
+	Wait_For_Expected_Response("OK");
+	
+	UART_SendString("AT+SAPBR=3,1,\"PWD\",\"");
+	UART_SendString(_PASSWORD);
+	UART_SendString("\"\r");
+	Wait_For_Expected_Response("OK");
+	
+	UART_SendString("AT+SAPBR=1,1\r");
+	return Wait_For_Expected_Response("OK");
+}
+
+bool HTTP_Init(void)
+{
+	UART_SendString("AT+HTTPINIT\r");
+	return Wait_For_Expected_Response("OK");
+}
+
+
+bool HTTP_Terminate(void)
+{
+	UART_SendString("AT+HTTPTERM\r");
+	return Wait_For_Expected_Response("OK");
+}
+
+
+bool HTTP_Setup_URL(char *url)        //sets URL
+{
+	return HTTP_Parameter("URL", url);
+}
+
+bool HTTP_Connected(void)             //check if connected
+{
+	UART_SendString("AT+SAPBR=2,1\r");
+	CRLF_COUNT = 2;
+	return Wait_For_Expected_Response("+SAPBR: 1,1");
+}
+
+
+bool HTTP_Setpost_json(void)
+{
+	return HTTP_Parameter("CONTENT", "application/json");
+}
+
+
+
+
+bool HTTP_Save(void)
+{
+	UART_SendString("AT+HTTPSCONT\r");
+	return Wait_For_Expected_Response("OK");
+}
+
+
+
+
+
+bool HTTP_Data(char *data)                 //load HTTP data
+{
+	char _buffer[25];
+	sprintf(_buffer, "AT+HTTPDATA=%d,%d\r", strlen(data), 10000);
+	UART_SendString(_buffer);
+	
+	if(Wait_For_Expected_Response("DOWNLOAD"))
+	{
+		return Send_AT_and_Expect_Response(data, "OK");
+	}
+	else
+	{
+		return false;
+	}
+
+}
+
+
+bool HTTP_Action(char method)
+{
+	if(method == GET)
+	{
+		UART_SendString("AT+HTTPACTION=0\r");
+	}
+	if(method == POST)
+	{
+		UART_SendString("AT+HTTPACTION=1\r");
+	}
+	return Wait_For_Expected_Response("OK");
+}
+
+
+bool HTTP_Read(uint8_t StartByte, uint16_t Bytesize)
+{
+	char Command[25];
+	sprintf(Command, "AT+HTTPREAD=%d,%d\r",StartByte,Bytesize);
+	Command[25] = '\0';                     //check this part
+	UART_SendString(Command);
+	
+	CRLF_COUNT = 0;             
+	
+	if (Wait_For_Expected_Response("+HTTPREAD"))
+	{
+		GetResponseBody(RESPONSE_BUFFER, Bytesize);
+		return true;
+	}
+	else
+		return false;
+	                
+}
+
+
+uint8_t HTTP_Post(char *Parameters, uint16_t ResponseLength)
+{
+	HTTP_Parameter("CID", "1");
+	
+	if(!(HTTP_Data(Parameters) && HTTP_Action(POST)))
+	{
+		return SIM900_RESPONSE_TIMEOUT;
+	}
+	
+	bool status200 = Wait_For_Expected_Response(",200,");
+	
+	if (Response_Status == SIM900_RESPONSE_TIMEOUT)
+	{
+		return SIM900_RESPONSE_TIMEOUT;
+	}
+	
+	if(!status200)
+	{
+		return SIM900_RESPONSE_ERROR;
+	}
+	
+	HTTP_Read(0, ResponseLength);
+	return SIM900_RESPONSE_FINISHED;
+}
+
+
+bool SIM900HTTP_Init(void)
+{
+	HTTP_Terminate();
+	return HTTP_Init();
+}
+
+uint8_t HTTP_get(char *_URL, uint16_t ResponseLength)
+{
+	HTTP_Parameter("CID", "1");
+	HTTP_Parameter("URL", _URL);
+	HTTP_Action(GET);
+	Wait_For_Expected_Response("+HTTPACTION:0,");
+	
+	if(Response_Status == SIM900_RESPONSE_TIMEOUT)
+	{
+		return SIM900_RESPONSE_TIMEOUT;
+	}
+	
+	HTTP_Read(0, ResponseLength);
+	return SIM900_RESPONSE_FINISHED;
+}
+
+
+
+
+
+
+
+
+
+
+void UART_Init(void)
+{
+	UCSR0B |= (1 << TXEN0) | (1 << RXEN0);   //enable receiver and transmitter
+	UCSR0C |= (1 << UCSZ01) | (1 << UCSZ00);   //8bit data, 1 stop bit, no parity
+	UBRR0H = (unsigned char) (BAUD_PRESCALE >> 8);  //shift the baud rate to the two registers
+	UBRR0L = BAUD_PRESCALE;
+}
+
+void UART_Transmit(char data)
+{
+	while(!(UCSR0A & (1 << UDRE0)));   //wait for current transmission to end
+	UDR0 = data;             //copy the data to the UDR0 register
+}
+
+char UART_Receive(void)
+{
+	while((UCSR0A & (1 << RXC0)) == 0);   //wait
+	return (UDR0);
+	
+}
+
+void UART_SendString(char *str)
+{
+	int i = 0;
+	for (i = 0; str[i] != '\0' ; i++)
+	{
+		UART_Transmit(str[i]);
+	}
+}
+
+ISR(USART_RX_vect)
+{
+	/* flag for new message arrival */
+	//assign UDR0 to a variable
+	uint8_t oldsrg = SREG;
+	RESPONSE_BUFFER[Counter] = UDR0;    //copy data to buffer and increment
+	Counter++;
+	
+	if (Counter == DEFAULT_BUFFER_SIZE)
+	{
+		Counter = 0;
+	}
+	SREG = oldsrg;
+}
